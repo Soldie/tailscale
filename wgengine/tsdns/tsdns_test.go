@@ -7,11 +7,13 @@ package tsdns
 import (
 	"bytes"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 
 	dns "golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
+	"tailscale.com/tstest"
 )
 
 var testipv4 = netaddr.IPv4(1, 2, 3, 4)
@@ -178,9 +180,13 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func TestResolve(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name   string
@@ -212,9 +218,13 @@ func TestResolve(t *testing.T) {
 }
 
 func TestResolveReverse(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name string
@@ -244,6 +254,9 @@ func TestResolveReverse(t *testing.T) {
 }
 
 func TestDelegate(t *testing.T) {
+	rc := tstest.NewResourceCheck()
+	defer rc.Assert(t)
+
 	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6))
 	dnsHandleFunc("nxdomain.site.", resolveToNXDOMAIN)
 
@@ -271,12 +284,16 @@ func TestDelegate(t *testing.T) {
 		return
 	}
 
-	r := NewResolver(t.Logf, "ipn.dev")
-	r.SetNameservers([]string{
-		v4server.PacketConn.LocalAddr().String(),
-		v6server.PacketConn.LocalAddr().String(),
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: true})
+	r.SetUpstreams([]net.Addr{
+		v4server.PacketConn.LocalAddr(),
+		v6server.PacketConn.LocalAddr(),
 	})
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name  string
@@ -317,8 +334,12 @@ func TestDelegate(t *testing.T) {
 }
 
 func TestConcurrentSetMap(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
-	r.Start()
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: false})
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// This is purely to ensure that Resolve does not race with SetMap.
 	var wg sync.WaitGroup
@@ -334,17 +355,37 @@ func TestConcurrentSetMap(t *testing.T) {
 	wg.Wait()
 }
 
-func TestConcurrentSetNameservers(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
-	r.Start()
-	packet := dnspacket("google.com.", dns.TypeA)
+func TestConcurrentSetUpstreams(t *testing.T) {
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6))
 
-	// This is purely to ensure that delegation does not race with SetNameservers.
+	server, errch := serveDNS("127.0.0.1:0")
+	defer func() {
+		if err := <-errch; err != nil {
+			t.Errorf("server error: %v", err)
+		}
+	}()
+
+	if server == nil {
+		return
+	}
+	defer server.Shutdown()
+
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: true})
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
+
+	packet := dnspacket("test.site.", dns.TypeA)
+	// This is purely to ensure that delegation does not race with SetUpstreams.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r.SetNameservers([]string{"9.9.9.9:53"})
+		r.SetUpstreams([]net.Addr{
+			server.PacketConn.LocalAddr(),
+		})
 	}()
 	go func() {
 		defer wg.Done()
@@ -420,9 +461,13 @@ var nxdomainResponse = []byte{
 }
 
 func TestFull(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// One full packet and one error packet
 	tests := []struct {
@@ -450,9 +495,13 @@ func TestFull(t *testing.T) {
 }
 
 func TestAllocs(t *testing.T) {
-	r := NewResolver(t.Logf, "ipn.dev.")
+	r := NewResolver(ResolverConfig{Logf: t.Logf, RootDomain: "ipn.dev.", Forward: false})
 	r.SetMap(dnsMap)
-	r.Start()
+
+	if err := r.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	// It is seemingly pointless to test allocs in the delegate path,
 	// as dialer.Dial -> Read -> Write alone comprise 12 allocs.
@@ -478,9 +527,30 @@ func TestAllocs(t *testing.T) {
 }
 
 func BenchmarkFull(b *testing.B) {
-	r := NewResolver(b.Logf, "ipn.dev.")
+	dnsHandleFunc("test.site.", resolveToIP(testipv4, testipv6))
+
+	server, errch := serveDNS("127.0.0.1:0")
+	defer func() {
+		if err := <-errch; err != nil {
+			b.Errorf("server error: %v", err)
+		}
+	}()
+
+	if server == nil {
+		return
+	}
+	defer server.Shutdown()
+
+	r := NewResolver(ResolverConfig{Logf: b.Logf, RootDomain: "ipn.dev.", Forward: true})
 	r.SetMap(dnsMap)
-	r.Start()
+	r.SetUpstreams([]net.Addr{
+		server.PacketConn.LocalAddr(),
+	})
+
+	if err := r.Start(); err != nil {
+		b.Fatalf("start: %v", err)
+	}
+	defer r.Close()
 
 	tests := []struct {
 		name    string
@@ -488,7 +558,7 @@ func BenchmarkFull(b *testing.B) {
 	}{
 		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA)},
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR)},
-		{"nxdomain", dnspacket("test3.ipn.dev.", dns.TypeA)},
+		{"delegated", dnspacket("test.site.", dns.TypeA)},
 	}
 
 	for _, tt := range tests {
